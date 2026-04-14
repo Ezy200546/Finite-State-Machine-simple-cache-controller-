@@ -1,106 +1,192 @@
-#include <iostream>
-#include <vector>
-#include <string>
-#include <cstdio>
+#include <stdio.h>
+#include "cpu.h"
+#include "memory.h"
 #include "cache_controller.h"
 
-void runRequest(CacheController& ctrl, Memory& mem,
-                const CPURequest& req, const std::string& description)
-{
-    printf("\n==========================================================\n");
-    printf("  %-55s\n", description.c_str());
-    printf("  %s addr=0x%X%s%-44s\n",
-           req.op == OpType::READ ? "READ " : "WRITE",
-           req.address,
-           req.op == OpType::WRITE ? (" data=" + std::to_string(req.writeData) + " ").c_str() : "  ",
-           "");
+// Forward declaration of the FSM tick function
+int controllerTick(CacheController* ctrl, Memory* mem, Request req, int cycle);
+void controllerInit(CacheController* ctrl);
+void printCache(CacheController* ctrl);
 
-    printf("==========================================================\n");
+// ---- Print a section header ------------------------------------------------
 
-    bool done = false;
-    int safeguard = 0;
+void printSection(const char* title) {
+    printf("\n==============================================================\n");
+    printf("  %s\n", title);
+    printf("==============================================================\n\n");
+}
 
-    while (!done && safeguard < 20) {
-        done = ctrl.tick(req);
-        ctrl.printSignals();
-        safeguard++;
+// ---- Print the CPU queue contents ------------------------------------------
+
+void printQueue(CPU* cpu) {
+    int i, idx;
+    printf("  CPU Queue (%d request(s)):\n", cpu->count);
+    if (cpu->count == 0) {
+        printf("    (empty)\n");
+        return;
+    }
+    for (i = 0; i < cpu->count; i++) {
+        idx = (cpu->head + i) % QUEUE_MAX;
+        printf("    [%d] %s addr=0x%X",
+            i,
+            cpu->queue[idx].op == OP_READ ? "READ " : "WRITE",
+            cpu->queue[idx].address);
+        if (cpu->queue[idx].op == OP_WRITE) {
+            printf(" data=%d", cpu->queue[idx].data);
+        }
+        if (i == 0) printf("  <-- next to process");
+        printf("\n");
+    }
+    printf("\n");
+}
+
+// ---- Run the simulation: unified clock loop --------------------------------
+// The CPU feeds requests from its queue one at a time.
+// The cache controller FSM processes each request over possibly many cycles.
+// The CPU waits (stalls) until cache_ready is asserted, then sends the next.
+
+void runSimulation(CPU* cpu, CacheController* ctrl, Memory* mem) {
+    int cycle    = 0;
+    int maxCycles= 200;  // safety limit
+
+    printf("  Starting simulation...\n");
+    printQueue(cpu);
+
+    while (cpu->count > 0 && cycle < maxCycles) {
+        int done;
+        Request req;
+
+        cycle++;
+
+        // CPU sends the front request from the queue
+        req = cpuCurrentRequest(cpu);
+
+        // Tick the FSM with the current request
+        done = controllerTick(ctrl, mem, req, cycle);
+
+        if (done == 1) {
+            // cache_ready = 1: CPU can move to next request
+            printf("  [Cycle %3d] CPU: cache_ready received, popping request from queue.\n\n", cycle);
+            cpuAcknowledge(cpu);
+
+            // Print cache state after each completed request
+            printf("  Cache state after this request:\n");
+            printCache(ctrl);
+
+            if (cpu->count > 0) {
+                printf("  Next in queue:\n");
+                printQueue(cpu);
+            }
+        } else {
+            // stall_cpu = 1: CPU waits
+            cpuStall(cpu);
+        }
     }
 
-    printf("  ✓ Request complete in %d cycles.\n", safeguard);
-    printf("  Cache state after request:\n");
-    ctrl.printCache();
+    if (cycle >= maxCycles) {
+        printf("  [Warning] Simulation hit cycle limit.\n");
+    }
+
+    printf("  Simulation complete. Total cycles used: %d\n", cycle);
 }
 
-void section(const std::string& title) {
-    printf("\n==========================================================\n");
-    printf("=  %-56s=\n", title.c_str());
-    printf("==========================================================\n\n");
-}
+// ============================================================
+// MAIN: load test scenarios into the CPU queue and run
+// ============================================================
 
 int main() {
-    printf("\n==========================================================\n");
-    printf("      FSM-Based Cache Controller Simulation                 \n");
-    printf("      Based on Patterson & Hennessy Figure 5.38             \n");
-    printf("      Direct-mapped, Write-back, Write-allocate             \n");
-    printf("      Cache lines: %d | Memory latency: %d cycles            \n",
+    CPU             cpu;
+    Memory          mem;
+    CacheController ctrl;
+
+    printf("\n");
+    printf("##############################################################\n");
+    printf("##   FSM Cache Controller Simulation                        ##\n");
+    printf("##   Based on Patterson & Hennessy Figure 5.38              ##\n");
+    printf("##   Direct-mapped | Write-back | Write-allocate            ##\n");
+    printf("##   Cache lines: %d  |  Memory latency: %d cycles           ##\n",
            NUM_LINES, MEM_LATENCY);
-    printf("==========================================================\n");
+    printf("##############################################################\n");
 
-    Memory memory;
-    CacheController ctrl(memory);
+    // ----------------------------------------------------------
+    // SCENARIO 1: Basic hit and miss
+    //   - READ 0x100: cold miss (clean) -> Allocate -> hit
+    //   - READ 0x100: now a hit
+    //   - WRITE 0x100: write hit, sets dirty
+    // ----------------------------------------------------------
+    printSection("SCENARIO 1: Cold Miss, then Hit, then Write Hit");
 
-    section("SCENARIO 1: Cold READ (Compulsory Miss, Clean)");
-    runRequest(ctrl, memory,
-        CPURequest(OpType::READ, 0x100),
-        "READ 0x100 — cold start, cache is empty");
+    cpuInit(&cpu);
+    memoryInit(&mem);
+    controllerInit(&ctrl);
 
-    section("SCENARIO 2: Repeated READ (Cache Hit)");
-    runRequest(ctrl, memory,
-        CPURequest(OpType::READ, 0x100),
-        "READ 0x100 again — should be a cache hit");
+    cpuEnqueue(&cpu, OP_READ,  0x100, 0);
+    cpuEnqueue(&cpu, OP_READ,  0x100, 0);
+    cpuEnqueue(&cpu, OP_WRITE, 0x100, 999);
 
-    section("SCENARIO 3: WRITE to Cached Address (Write Hit)");
-    runRequest(ctrl, memory,
-        CPURequest(OpType::WRITE, 0x100, 0xABCD),
-        "WRITE 0x100 = 0xABCD — hit, sets dirty bit");
+    runSimulation(&cpu, &ctrl, &mem);
 
-    section("SCENARIO 4: READ Causing Dirty Eviction (Write-Back Path)");
-    runRequest(ctrl, memory,
-        CPURequest(OpType::READ, 0x500),
-        "READ 0x500 — same index as 0x100, dirty eviction triggered");
+    // ----------------------------------------------------------
+    // SCENARIO 2: Dirty eviction (Write-Back path)
+    //   - WRITE 0x100: cold miss, allocate, then write (dirty=1)
+    //   - READ  0x500: same index as 0x100, triggers write-back
+    //     Path: IDLE->COMPARE_TAG->WRITE_BACK->ALLOCATE->COMPARE_TAG->IDLE
+    // ----------------------------------------------------------
+    printSection("SCENARIO 2: Dirty Eviction (Full Write-Back Path)");
 
-    section("SCENARIO 5: WRITE Miss (Write-Allocate Policy)");
-    runRequest(ctrl, memory,
-        CPURequest(OpType::WRITE, 0x204, 0x1234),
-        "WRITE 0x204 = 0x1234 — cold write, allocate-then-write");
+    cpuInit(&cpu);
+    memoryInit(&mem);
+    controllerInit(&ctrl);
 
-    section("SCENARIO 6: Mixed Access Sequence (Realistic Workload)");
+    cpuEnqueue(&cpu, OP_WRITE, 0x100, 42);   // will make line dirty
+    cpuEnqueue(&cpu, OP_READ,  0x500, 0);    // same index, forces eviction
 
-    ctrl.reset();
-    printf("  (Controller and cache reset for fresh start)\n\n");
+    runSimulation(&cpu, &ctrl, &mem);
 
-    std::vector<std::pair<CPURequest, std::string>> sequence = {
-        { CPURequest(OpType::READ,  0x010),       "READ  0x010  (cold miss)" },
-        { CPURequest(OpType::READ,  0x020),       "READ  0x020  (cold miss)" },
-        { CPURequest(OpType::WRITE, 0x010, 99),    "WRITE 0x010 = 99  (write hit)" },
-        { CPURequest(OpType::READ,  0x010),       "READ  0x010  (read hit)" },
-        { CPURequest(OpType::READ,  0x110),       "READ  0x110  (miss, evicts 0x010 dirty)" },
-        { CPURequest(OpType::WRITE, 0x030, 42),    "WRITE 0x030 = 42  (write miss)" },
-        { CPURequest(OpType::READ,  0x030),       "READ  0x030  (read hit)" },
-    };
+    // ----------------------------------------------------------
+    // SCENARIO 3: Write miss (write-allocate policy)
+    //   - WRITE to a cold address: FSM fetches block first, then writes
+    //   - READ same address: should be a hit
+    // ----------------------------------------------------------
+    printSection("SCENARIO 3: Write Miss (Write-Allocate Policy)");
 
-    for (auto& item : sequence) {
-        runRequest(ctrl, memory, item.first, item.second);
-    }
+    cpuInit(&cpu);
+    memoryInit(&mem);
+    controllerInit(&ctrl);
 
-    printf("\n==========================================================\n");
-    printf("  Simulation complete. All FSM paths demonstrated:\n\n");
-    printf("  IDLE -> COMPARE_TAG -> IDLE              (hit)\n");
-    printf("  IDLE -> COMPARE_TAG -> ALLOCATE\n");
-    printf("       -> COMPARE_TAG -> IDLE             (clean miss)\n");
-    printf("  IDLE -> COMPARE_TAG -> WRITE_BACK\n");
-    printf("       -> ALLOCATE -> COMPARE_TAG -> IDLE (dirty miss)\n");
-    printf("==========================================================\n\n");
+    cpuEnqueue(&cpu, OP_WRITE, 0x204, 77);  // write miss: allocate first
+    cpuEnqueue(&cpu, OP_READ,  0x204, 0);   // should hit now
+
+    runSimulation(&cpu, &ctrl, &mem);
+
+    // ----------------------------------------------------------
+    // SCENARIO 4: Realistic mixed workload
+    //   A longer sequence showing all FSM paths in one run
+    // ----------------------------------------------------------
+    printSection("SCENARIO 4: Mixed Workload (All Paths)");
+
+    cpuInit(&cpu);
+    memoryInit(&mem);
+    controllerInit(&ctrl);
+
+    cpuEnqueue(&cpu, OP_READ,  0x010, 0);    // cold miss
+    cpuEnqueue(&cpu, OP_READ,  0x010, 0);    // hit
+    cpuEnqueue(&cpu, OP_WRITE, 0x010, 55);   // write hit -> dirty
+    cpuEnqueue(&cpu, OP_READ,  0x010, 0);    // read hit (dirty line)
+    cpuEnqueue(&cpu, OP_READ,  0x110, 0);    // same index, dirty eviction
+    cpuEnqueue(&cpu, OP_WRITE, 0x020, 88);   // write miss (write-allocate)
+    cpuEnqueue(&cpu, OP_READ,  0x020, 0);    // hit
+
+    runSimulation(&cpu, &ctrl, &mem);
+
+    printf("\n##############################################################\n");
+    printf("##  All scenarios done. FSM paths covered:                  ##\n");
+    printf("##  [1] IDLE -> COMPARE_TAG -> IDLE             (hit)       ##\n");
+    printf("##  [2] IDLE -> COMPARE_TAG -> ALLOCATE                     ##\n");
+    printf("##          -> COMPARE_TAG -> IDLE          (clean miss)    ##\n");
+    printf("##  [3] IDLE -> COMPARE_TAG -> WRITE_BACK                   ##\n");
+    printf("##          -> ALLOCATE -> COMPARE_TAG -> IDLE (dirty miss) ##\n");
+    printf("##############################################################\n\n");
 
     return 0;
 }
