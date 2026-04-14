@@ -1,4 +1,4 @@
-#include <stdio.h>
+#include <cstdio>
 #include "cache_controller.h"
 #include "cpu.h"
 
